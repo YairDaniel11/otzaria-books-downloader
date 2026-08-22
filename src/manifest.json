@@ -1,0 +1,35 @@
+﻿{
+  "schemaVersion": 1,
+  "id": "otzaria-github-downloader",
+  "name": "הורדת ספרים",
+  "version": "3.1.8",
+  "description": "הורדה ועדכון מאגר ספרים מ-GitHub",
+  "author": "Yair Daniel",
+  "stability": "beta",
+  "entrypoint": "index.html",
+  "minAppVersion": "0.9.94",
+  "sdkVersion": "1.x",
+  "permissions": [
+    "network.access",
+    "ui.feedback",
+    "plugin.storage.read",
+    "plugin.storage.write",
+    "events.subscribe:theme.changed"
+  ],
+  "network": {
+    "enabled": true,
+    "allowlist": [
+      "https://api.github.com/repos/YairDaniel11/Otzarya-Unofficial-Books",
+      "https://github.com/YairDaniel11/Otzarya-Unofficial-Books",
+      "https://raw.githubusercontent.com/YairDaniel11/Otzarya-Unofficial-Books"
+    ]
+  },
+  "contributes": {
+    "toolTab": {
+      "title": "הורדת ספרים",
+      "order": 100,
+      "defaultPinned": true,
+      "iconName": "document_arrow_down_24_regular"
+    }
+  }
+}

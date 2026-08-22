@@ -1,0 +1,4 @@
+.build-stage/
+*.otzplugin
+.DS_Store
+Thumbs.db
