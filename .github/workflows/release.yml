@@ -1,5 +1,12 @@
 name: Release
 
+# פרסום דרך ה-Action הרשמי של אוצריא: אימות, בנייה, ופרסום לחנות.
+# הטריגר נשאר תג — התג הוא מקור האמת לגרסה, והמניפסט מסונכרן אליו.
+#
+# מדוע לא תהליך משלנו: התהליך הקודם התחבר לחנות בעצמו מול
+# /api/auth/callback/credentials, ואחרי שינוי בצד השרת ההתחברות הזו החלה
+# להידחות. ה-Action הרשמי מתוחזק יחד עם החנות ולכן עוקב אחרי החוזה.
+
 on:
   push:
     tags:
@@ -7,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release as (e.g. v3.1.9)'
+        description: 'תג לפרסום (למשל v3.1.9)'
         required: true
         type: string
 
@@ -15,259 +22,67 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build .otzplugin (Windows)
-    runs-on: windows-latest
+  release:
+    name: Validate, build and publish
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Determine release tag
-        id: tag
-        shell: pwsh
+      - name: Determine version and sync the manifest
+        id: v
         run: |
-          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
-            $tag = '${{ inputs.tag }}'
-          } else {
-            $tag = '${{ github.ref_name }}'
-          }
-          $version = $tag -replace '^v',''
-          if ($version -notmatch '^\d+\.\d+\.\d+$') {
-            Write-Error "Tag must look like vX.Y.Z (got '$tag')"
-            exit 1
-          }
-          "tag=$tag"         | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Releasing tag=$tag version=$version"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          version="${tag#v}"
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "התג חייב להיראות vX.Y.Z (התקבל '$tag')"; exit 1 ;;
+          esac
+          node -e "
+            const fs=require('fs'), p='src/manifest.json';
+            const m=JSON.parse(fs.readFileSync(p,'utf8').replace(/^\uFEFF/,''));
+            m.version=process.argv[1];
+            fs.writeFileSync(p, JSON.stringify(m,null,2)+'\n');
+          " "$version"
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Sync manifest version with tag
-        shell: pwsh
-        env:
-          NEW_VERSION: ${{ steps.tag.outputs.version }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $manifestPath = 'src/manifest.json'
-          $content = Get-Content $manifestPath -Raw -Encoding UTF8
-          $pattern = '("version"\s*:\s*")[^"]+(")'
-          if ($content -notmatch $pattern) {
-            Write-Error "version field not found in $manifestPath"
-            exit 1
-          }
-          $new = [regex]::Replace($content, $pattern, "`${1}$($env:NEW_VERSION)`${2}", 1)
-          if ($new -eq $content) {
-            Write-Host "manifest.json already at version $env:NEW_VERSION"
-          } else {
-            [System.IO.File]::WriteAllText((Resolve-Path $manifestPath), $new, (New-Object System.Text.UTF8Encoding $false))
-            Write-Host "manifest.json version -> $env:NEW_VERSION"
-          }
-
-      - name: Build plugin
-        shell: pwsh
-        run: |
-          .\build.ps1
-
-      # שלוש הבדיקות כאן תופסות מראש כשלים שאוצריא או החנות מחזירות רק
-      # בזמן ההתקנה: manifest שלא בשורש הארכיון, name שאינו זהה לכותרת
-      # הלשונית, ותיאור ארוך מ-150 תווים.
-      - name: Verify package contents
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Add-Type -Assembly System.IO.Compression.FileSystem
-          $z = [System.IO.Compression.ZipFile]::OpenRead("$PWD\otzaria-books-downloader.otzplugin")
-          $z.Entries | ForEach-Object { "{0,12}  {1}" -f $_.Length, $_.FullName }
-          $entry = $z.Entries | Where-Object { $_.FullName -eq 'manifest.json' }
-          if (-not $entry) {
-            $z.Dispose()
-            Write-Error "manifest.json missing from package root"
-            exit 1
-          }
-          $reader = New-Object System.IO.StreamReader($entry.Open())
-          $json = $reader.ReadToEnd()
-          $reader.Dispose()
-          $z.Dispose()
-          $m = $json.TrimStart([char]0xFEFF) | ConvertFrom-Json
-          if ($m.version -ne '${{ steps.tag.outputs.version }}') {
-            Write-Error "packaged version $($m.version) != tag version ${{ steps.tag.outputs.version }}"
-            exit 1
-          }
-          if ($m.name -ne $m.contributes.toolTab.title) {
-            Write-Error "manifest 'name' ($($m.name)) must equal contributes.toolTab.title ($($m.contributes.toolTab.title)) or Otzaria refuses to install"
-            exit 1
-          }
-          if ($m.description.Length -gt 150) {
-            Write-Error "manifest description is $($m.description.Length) chars — the limit is 150"
-            exit 1
-          }
-          Write-Host "OK: version $($m.version), name '$($m.name)', description $($m.description.Length) chars"
-
-      - name: Compute SHA-256
-        id: sha
-        shell: pwsh
-        run: |
-          $hash = (Get-FileHash -Algorithm SHA256 .\otzaria-books-downloader.otzplugin).Hash.ToLower()
-          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "SHA-256: $hash"
-
-      - name: Name the release asset with its version
-        shell: pwsh
-        run: |
-          Copy-Item .\otzaria-books-downloader.otzplugin ".\otzaria-books-downloader-v${{ steps.tag.outputs.version }}.otzplugin"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - name: Validate, build and publish to the store
+        id: otzaria
+        uses: Otzaria/otzaria-plugin-validator@v1
         with:
-          name: otzaria-books-downloader-${{ steps.tag.outputs.version }}
-          path: otzaria-books-downloader-v${{ steps.tag.outputs.version }}.otzplugin
-          if-no-files-found: error
+          path: src
+          build: 'true'
+          otzaria-user: ${{ secrets.OTZARIA_USER }}
+          otzaria-password: ${{ secrets.OTZARIA_PASSWORD }}
 
       - name: Create GitHub Release
+        if: steps.otzaria.outputs.plugin-file != ''
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
-          draft: false
-          prerelease: false
+          tag_name: ${{ steps.v.outputs.tag }}
+          name: ${{ steps.v.outputs.tag }}
           generate_release_notes: true
-          files: otzaria-books-downloader-v${{ steps.tag.outputs.version }}.otzplugin
+          files: ${{ steps.otzaria.outputs.plugin-file }}
           body: |
-            ## הורדת ספרים — ${{ steps.tag.outputs.tag }}
-
-            הורדה ועדכון של מאגר ספרים חיצוני לאוצריא.
+            ## הורדת ספרים — ${{ steps.v.outputs.tag }}
 
             ### התקנה
-            הורד את קובץ ה-`.otzplugin` שלמטה, ובאוצריא:
-            **הגדרות → ניהול תוספים → התקנה מקובץ**.
-            המשתמשים שהתקינו מהחנות מקבלים את העדכון אוטומטית.
+            מי שהתקין מהחנות מקבל את העדכון אוטומטית. להתקנה ידנית הורידו את
+            קובץ ה-`.otzplugin` שלמטה, ובאוצריא: **הגדרות → ניהול תוספים → התקנה מקובץ**.
 
             ### Checksum
             ```
-            SHA-256: ${{ steps.sha.outputs.sha256 }}
+            SHA-256: ${{ steps.otzaria.outputs.sha256 }}
             ```
 
-      # מתפרסם לחנות רק כששלושת הסודות מוגדרים במאגר. בלעדיהם השלב מדולג
-      # בשקט וה-Release עדיין נוצר, כך שאפשר להתקין ידנית מהקובץ.
-      - name: Publish update to otzaria.org
-        # הקשר secrets אינו זמין ב-if של שלב; env כן, והוא מוגדר למטה.
-        if: ${{ env.OTZARIA_USER != '' && env.OTZARIA_PASSWORD != '' && env.OTZARIA_PLUGIN_ID != '' }}
-        shell: pwsh
-        env:
-          OTZARIA_BASE_URL: ${{ vars.OTZARIA_BASE_URL }}
-          OTZARIA_USER: ${{ secrets.OTZARIA_USER }}
-          OTZARIA_PASSWORD: ${{ secrets.OTZARIA_PASSWORD }}
-          OTZARIA_PLUGIN_ID: ${{ secrets.OTZARIA_PLUGIN_ID }}
-          NEW_VERSION: ${{ steps.tag.outputs.version }}
-          PLUGIN_FILE: otzaria-books-downloader.otzplugin
+      - name: Summary
         run: |
-          $ErrorActionPreference = 'Stop'
-          # ── ניסיון חוזר ──
-          # otzaria.org החזירה 504 באמצע פרסום, וה-Release כבר נוצר: התג
-          # קיים, ולכן ריצה חוזרת דילגה על הכל ולא היה איך לנסות שוב בלי
-          # להעלות ספרת גרסה סתם. שגיאת רשת או 5xx היא זמנית כמעט תמיד,
-          # ולכן היא נבלעת ומנוסה שוב; 4xx (הרשאה, קלט פסול) נכשלת מיד -
-          # חזרה עליה רק מאריכה את הריצה.
-          function Invoke-WithRetry {
-            param([scriptblock]$Action, [string]$What, [int]$Tries = 4)
-            for ($i = 1; $i -le $Tries; $i++) {
-              try { return & $Action }
-              catch {
-                $status = $null
-                try { $status = [int]$_.Exception.Response.StatusCode } catch { }
-                $transient = ($null -eq $status) -or ($status -ge 500) -or ($status -eq 408) -or ($status -eq 429)
-                if (-not $transient -or $i -eq $Tries) {
-                  Write-Host "::error::$What נכשל: $($_.Exception.Message)"
-                  throw
-                }
-                $wait = [Math]::Pow(2, $i) * 5
-                Write-Host "::warning::$What נכשל (ניסיון $i/$Tries, סטטוס $status) - ממתין $wait שניות"
-                Start-Sleep -Seconds $wait
-              }
-            }
-          }
-
-          $base = if ($env:OTZARIA_BASE_URL) { $env:OTZARIA_BASE_URL.TrimEnd('/') } else { 'https://otzaria.org' }
-
-          # 1) CSRF token (cookie persisted in $sess)
-          $csrf = Invoke-WithRetry { Invoke-RestMethod -Uri "$base/api/auth/csrf" -SessionVariable sess -UseBasicParsing } "קבלת אסימון CSRF"
-          if (-not $csrf.csrfToken) { Write-Error 'Failed to fetch CSRF token'; exit 1 }
-
-          # 2) Credentials login (NextAuth Credentials provider)
-          $loginBody = @{
-            csrfToken   = $csrf.csrfToken
-            identifier  = $env:OTZARIA_USER
-            password    = $env:OTZARIA_PASSWORD
-            callbackUrl = "$base/library/admin/plugins"
-            json        = 'true'
-          }
-          try {
-            $null = Invoke-WithRetry { Invoke-WebRequest -Uri "$base/api/auth/callback/credentials" `
-                -Method Post -Body $loginBody -WebSession $sess `
-                -UseBasicParsing -MaximumRedirection 5 } "התחברות"
-          } catch {
-            Write-Error "Login request failed: $($_.Exception.Message)"; exit 1
-          }
-
-          # 3) Verify session (admin OR plugin owner — backend enforces ownership)
-          $session = Invoke-WithRetry { Invoke-RestMethod -Uri "$base/api/auth/session" -WebSession $sess -UseBasicParsing } "אימות ההתחברות"
-          if (-not $session.user) {
-            Write-Error 'Login failed: empty session (check OTZARIA_USER / OTZARIA_PASSWORD)'; exit 1
-          }
-          Write-Host "Logged in as $($session.user.email) (role: $($session.user.role))"
-
-          # 4) Fetch current plugin fields (admin edit endpoint)
-          $editUrl = "$base/api/admin/plugins/$env:OTZARIA_PLUGIN_ID/edit"
-          $current = Invoke-WithRetry { Invoke-RestMethod -Uri $editUrl -WebSession $sess -UseBasicParsing } "קריאת פרטי התוסף"
-          Write-Host "Current site version: $($current.version) -> new: $env:NEW_VERSION"
-
-          if (-not (Test-Path $env:PLUGIN_FILE)) {
-            Write-Error "Plugin file not found: $env:PLUGIN_FILE"; exit 1
-          }
-
-          # 5) Build multipart and PUT the update
-          $tagsJson = ConvertTo-Json -InputObject @($current.tags) -Compress
-          if ($tagsJson -eq 'null') { $tagsJson = '[]' }
-
-          $form = @{
-            name             = $current.name
-            shortDescription = $current.shortDescription
-            description      = $current.description
-            version          = $env:NEW_VERSION
-            status           = $current.status
-            author           = $current.author
-            compatibleWith   = $current.compatibleWith
-            requiresNetwork  = if ($current.requiresNetwork) { 'true' } else { 'false' }
-            tags             = $tagsJson
-            homepage         = if ($current.homepage) { $current.homepage } else { '' }
-            pluginFile       = Get-Item -Path $env:PLUGIN_FILE
-          }
-
-          $result = Invoke-WithRetry { Invoke-RestMethod -Uri $editUrl -Method Put -Form $form -WebSession $sess -UseBasicParsing } "העלאת העדכון"
-          $result | ConvertTo-Json -Depth 5
-          Write-Host "::notice::Plugin updated on $base (version $env:NEW_VERSION)"
-
-      # נוחות בלבד: הפרסום כבר הושלם, ולכן כשל כאן לא מכשיל את הריצה.
-      - name: Commit manifest version bump
-        if: ${{ github.event_name == 'push' }}
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          git config user.email "action@github.com"
-          git config user.name  "GitHub Action"
-          git fetch origin main
-          git checkout main
-          # התג נבנה מקומית עם הגרסה החדשה; כאן היא נשמרת גם ב-main כדי
-          # שהמאגר לא יישאר עם מספר גרסה ישן מזה שפורסם בפועל.
-          $manifestPath = 'src/manifest.json'
-          $content = Get-Content $manifestPath -Raw -Encoding UTF8
-          $new = [regex]::Replace($content, '("version"\s*:\s*")[^"]+(")', "`${1}${{ steps.tag.outputs.version }}`${2}", 1)
-          [System.IO.File]::WriteAllText((Resolve-Path $manifestPath), $new, (New-Object System.Text.UTF8Encoding $false))
-          git add $manifestPath
-          git diff --cached --quiet
-          if ($LASTEXITCODE -ne 0) {
-            git commit -m "גרסה ${{ steps.tag.outputs.version }}"
-            git push origin main
-          } else {
-            Write-Host "manifest already at ${{ steps.tag.outputs.version }} on main"
-          }
+          echo "גרסה: ${{ steps.v.outputs.version }}"
+          echo "אימות עבר: ${{ steps.otzaria.outputs.passed }}"
+          echo "פורסם לחנות: ${{ steps.otzaria.outputs.published }}"
