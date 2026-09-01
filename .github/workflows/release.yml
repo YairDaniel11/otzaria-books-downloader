@@ -161,10 +161,35 @@ jobs:
           PLUGIN_FILE: otzaria-books-downloader.otzplugin
         run: |
           $ErrorActionPreference = 'Stop'
+          # ── ניסיון חוזר ──
+          # otzaria.org החזירה 504 באמצע פרסום, וה-Release כבר נוצר: התג
+          # קיים, ולכן ריצה חוזרת דילגה על הכל ולא היה איך לנסות שוב בלי
+          # להעלות ספרת גרסה סתם. שגיאת רשת או 5xx היא זמנית כמעט תמיד,
+          # ולכן היא נבלעת ומנוסה שוב; 4xx (הרשאה, קלט פסול) נכשלת מיד -
+          # חזרה עליה רק מאריכה את הריצה.
+          function Invoke-WithRetry {
+            param([scriptblock]$Action, [string]$What, [int]$Tries = 4)
+            for ($i = 1; $i -le $Tries; $i++) {
+              try { return & $Action }
+              catch {
+                $status = $null
+                try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+                $transient = ($null -eq $status) -or ($status -ge 500) -or ($status -eq 408) -or ($status -eq 429)
+                if (-not $transient -or $i -eq $Tries) {
+                  Write-Host "::error::$What נכשל: $($_.Exception.Message)"
+                  throw
+                }
+                $wait = [Math]::Pow(2, $i) * 5
+                Write-Host "::warning::$What נכשל (ניסיון $i/$Tries, סטטוס $status) - ממתין $wait שניות"
+                Start-Sleep -Seconds $wait
+              }
+            }
+          }
+
           $base = if ($env:OTZARIA_BASE_URL) { $env:OTZARIA_BASE_URL.TrimEnd('/') } else { 'https://otzaria.org' }
 
           # 1) CSRF token (cookie persisted in $sess)
-          $csrf = Invoke-RestMethod -Uri "$base/api/auth/csrf" -SessionVariable sess -UseBasicParsing
+          $csrf = Invoke-WithRetry { Invoke-RestMethod -Uri "$base/api/auth/csrf" -SessionVariable sess -UseBasicParsing } "קבלת אסימון CSRF"
           if (-not $csrf.csrfToken) { Write-Error 'Failed to fetch CSRF token'; exit 1 }
 
           # 2) Credentials login (NextAuth Credentials provider)
@@ -176,15 +201,15 @@ jobs:
             json        = 'true'
           }
           try {
-            $null = Invoke-WebRequest -Uri "$base/api/auth/callback/credentials" `
-              -Method Post -Body $loginBody -WebSession $sess `
-              -UseBasicParsing -MaximumRedirection 5
+            $null = Invoke-WithRetry { Invoke-WebRequest -Uri "$base/api/auth/callback/credentials" `
+                -Method Post -Body $loginBody -WebSession $sess `
+                -UseBasicParsing -MaximumRedirection 5 } "התחברות"
           } catch {
             Write-Error "Login request failed: $($_.Exception.Message)"; exit 1
           }
 
           # 3) Verify session (admin OR plugin owner — backend enforces ownership)
-          $session = Invoke-RestMethod -Uri "$base/api/auth/session" -WebSession $sess -UseBasicParsing
+          $session = Invoke-WithRetry { Invoke-RestMethod -Uri "$base/api/auth/session" -WebSession $sess -UseBasicParsing } "אימות ההתחברות"
           if (-not $session.user) {
             Write-Error 'Login failed: empty session (check OTZARIA_USER / OTZARIA_PASSWORD)'; exit 1
           }
@@ -192,7 +217,7 @@ jobs:
 
           # 4) Fetch current plugin fields (admin edit endpoint)
           $editUrl = "$base/api/admin/plugins/$env:OTZARIA_PLUGIN_ID/edit"
-          $current = Invoke-RestMethod -Uri $editUrl -WebSession $sess -UseBasicParsing
+          $current = Invoke-WithRetry { Invoke-RestMethod -Uri $editUrl -WebSession $sess -UseBasicParsing } "קריאת פרטי התוסף"
           Write-Host "Current site version: $($current.version) -> new: $env:NEW_VERSION"
 
           if (-not (Test-Path $env:PLUGIN_FILE)) {
@@ -217,7 +242,7 @@ jobs:
             pluginFile       = Get-Item -Path $env:PLUGIN_FILE
           }
 
-          $result = Invoke-RestMethod -Uri $editUrl -Method Put -Form $form -WebSession $sess -UseBasicParsing
+          $result = Invoke-WithRetry { Invoke-RestMethod -Uri $editUrl -Method Put -Form $form -WebSession $sess -UseBasicParsing } "העלאת העדכון"
           $result | ConvertTo-Json -Depth 5
           Write-Host "::notice::Plugin updated on $base (version $env:NEW_VERSION)"
 
