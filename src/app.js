@@ -1,10 +1,12 @@
-// v3.1.8
+// v3.2.1 — network.fetch הוחלף ב-network.fetchStream (הוסר באוצריא 0.9.98)
 // מאגר ההפצה הפעיל. Open-Otzarya-Projects הוקפא ב-29/6/2026 וחסרים בו 17
 // מ-85 קבצי ה-zip, ולכן הרשימה וההורדות עברו לכאן.
 //
 // דורש אישור ברשימת ההיתר של אוצריא (plugin_network_allowlist) — שלוש
 // הכתובות של הריפו הזה תחת api.github.com, github.com ו-raw.githubusercontent.
 // עד שהאישור נכנס לתוקף, network.fetch נחסם והרשימה לא נטענת כלל.
+// raw.githubusercontent נחסם לפעמים גם לאחר האישור ע"י מסנני תוכן (למשל NetFree
+// מחזיר עמוד חסימה במקום התוכן) — לכן יש גיבוי דרך Contents API, ראה fetchBooksData.
 const GITHUB_REPO    = 'YairDaniel11/Otzarya-Unofficial-Books';
 const LATEST_DL      = `https://github.com/${GITHUB_REPO}/releases/latest/download/`;
 // cache-buster: raw.githubusercontent מוגש דרך CDN שמחזיק תשובה עד 5 דקות,
@@ -13,6 +15,9 @@ const BOOKS_DATA_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/bo
 function booksDataUrl() {
     return `${BOOKS_DATA_URL}?t=${Date.now()}`;
 }
+// גיבוי כש-raw.githubusercontent חסום (מסנני תוכן כמו NetFree מחזירים עמוד
+// חסימה במקומו) — Contents API של גיטהאב עצמו, שאינו נחסם באותו אופן.
+const CONTENTS_API_URL = `https://api.github.com/repos/${GITHUB_REPO}/contents/books_data.js?ref=main`;
 
 let expandedPaths  = new Set();
 let booted         = false;
@@ -76,45 +81,75 @@ function errorText(raw) {
 }
 
 /// ממפה שגיאה גולמית להודעה בעברית שאומרת למשתמש מה לעשות.
+///
+/// הטקסט הגולמי (`raw`) מצורף בסוגריים בכל מקרה — גם כשהוא נופל תחת אחת
+/// מהקטגוריות המוכרות — כי הקטגוריות מבוססות על ניחוש דפוסים, וכשהניחוש שגוי
+/// (למשל "network" מופיע גם בשגיאות שאינן קשורות לרשת בפועל) הטקסט הגולמי הוא
+/// הדרך היחידה לאבחן מה קרה באמת.
 function describeFetchError(raw) {
     const text = errorText(raw);
+    const suffix = text ? ` (גולמי: ${text.replace(/^Exception:\s*/, '').slice(0, 200)})` : '';
     if (text.includes('error.forbidden')) {
         return 'הכתובת אינה ברשימת ההיתר לגישת רשת של תוספים באוצריא. ' +
-               `יש לאשר את ${GITHUB_REPO} ברשימת ההיתר.`;
+               `יש לאשר את ${GITHUB_REPO} ברשימת ההיתר.${suffix}`;
     }
     if (text.includes('error.permission_denied')) {
-        return 'לתוסף אין הרשאת גישה לאינטרנט. ניתן להפעיל בהגדרות → ניהול תוספים.';
+        return `לתוסף אין הרשאת גישה לאינטרנט. ניתן להפעיל בהגדרות → ניהול תוספים.${suffix}`;
     }
-    if (/timeout|timed out/i.test(text)) return 'הבקשה לגיטאב פגה בזמן.';
+    if (/timeout|timed out/i.test(text)) return `הבקשה לגיטאב פגה בזמן.${suffix}`;
     if (/SocketException|Failed host lookup|network|ClientException/i.test(text)) {
-        return 'אין חיבור לאינטרנט או שגיטאב אינו נגיש.';
+        return `אין חיבור לאינטרנט או שגיטאב אינו נגיש.${suffix}`;
     }
     if (text) return text.replace(/^Exception:\s*/, '').slice(0, 300);
     return 'לא התקבל פירוט מאוצריא. נסה שוב, ואם זה חוזר — בדוק חיבור לאינטרנט.';
 }
 
+function parseBooksDataText(text) {
+    const json = text.replace(/^\s*const BOOKS_DATA\s*=\s*/, '').replace(/\s*;\s*$/, '');
+    return JSON.parse(json);
+}
+
+/// `network.fetch` הוסר באוצריא 0.9.98 (מחזיר `error.unknown_method`) — התחליף
+/// הרשמי הוא `network.fetchStream`, שמחזיר AsyncIterable של chunks במקום תשובה
+/// אחת. העטיפה הזו צוברת אותם בחזרה לתשובה אחת כדי שהקוד סביבה יישאר כמו שהיה.
+async function fetchText(url, options) {
+    let meta = null, body = '';
+    for await (const chunk of Otzaria.call('network.fetchStream', { url, ...(options || {}) })) {
+        if (chunk.type === 'response') meta = chunk;
+        else if (chunk.type === 'data') body += chunk.body;
+    }
+    if (!meta) throw new Error('no response');
+    return { status: meta.status, ok: meta.ok, headers: meta.headers, body };
+}
+
 async function fetchBooksData() {
     lastFetchError = null;
-    try {
-        if (typeof Otzaria === 'undefined') {
-            lastFetchError = 'התוסף פועל רק בתוך אוצריא.';
-            return null;
-        }
-        const res = await Otzaria.call('network.fetch', { url: booksDataUrl() });
-        if (!res.success) {
-            lastFetchError = describeFetchError(res.error ?? res.message);
-            return null;
-        }
-        if (!res.data.ok) {
-            lastFetchError = `גיטאב החזיר שגיאה ${res.data.status}.`;
-            return null;
-        }
-        const text = res.data.body;
-        const json = text.replace(/^\s*const BOOKS_DATA\s*=\s*/, '').replace(/\s*;\s*$/, '');
-        return JSON.parse(json);
-    } catch (e) {
-        lastFetchError = describeFetchError(e?.message ?? e);
+    if (typeof Otzaria === 'undefined') {
+        lastFetchError = 'התוסף פועל רק בתוך אוצריא.';
         return null;
+    }
+
+    try {
+        const res = await fetchText(booksDataUrl());
+        if (!res.ok) throw `גיטאב החזיר שגיאה ${res.status}.`;
+        return parseBooksDataText(res.body);
+    } catch (rawFail) {
+        // ננסה גיבוי רק כשזו כשל רשת אמיתי (למשל חסימה של raw.githubusercontent
+        // ע"י מסנן תוכן) — לא כשהכתובת עצמה נדחתה (אין הרשאה), כי אז גם ה-API יידחה.
+        const rawErrorText = describeFetchError(rawFail?.message ?? rawFail);
+        if (rawErrorText.includes('ברשימת ההיתר') || rawErrorText.includes('הרשאת גישה')) {
+            lastFetchError = rawErrorText;
+            return null;
+        }
+
+        try {
+            const res = await fetchText(CONTENTS_API_URL, { headers: { Accept: 'application/vnd.github.raw' } });
+            if (!res.ok) throw `גיטאב החזיר שגיאה ${res.status}.`;
+            return parseBooksDataText(res.body);
+        } catch (apiFail) {
+            lastFetchError = rawErrorText || describeFetchError(apiFail?.message ?? apiFail);
+            return null;
+        }
     }
 }
 
