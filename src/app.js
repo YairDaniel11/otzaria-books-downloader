@@ -1,3 +1,5 @@
+// v3.2.2 — נוספה הרשאת fs.folder_access (חסרה מה-manifest; בלעדיה
+// ui.pickFolder נכשל בשקט עם permission_denied וכפתורי ההורדה לא עשו דבר)
 // v3.2.1 — network.fetch הוחלף ב-network.fetchStream (הוסר באוצריא 0.9.98)
 // מאגר ההפצה הפעיל. Open-Otzarya-Projects הוקפא ב-29/6/2026 וחסרים בו 17
 // מ-85 קבצי ה-zip, ולכן הרשימה וההורדות עברו לכאן.
@@ -833,6 +835,12 @@ async function resolveDestFolder(title, { force = false } = {}) {
         folderRes = await Otzaria.call('ui.pickFolder', { title: full });
     } catch {
         showError('בחירת תיקייה אינה נתמכת בגרסה זו של אוצריא');
+        return null;
+    }
+    // כשל עם קוד שגיאה (למשל permission_denied) מוצג למשתמש — אחרת הכפתור
+    // "לא עושה כלום" בלי שום רמז למה. ביטול משתמש (אין error) נשאר שקט.
+    if (folderRes?.error) {
+        showError(describeFetchError(folderRes.error));
         return null;
     }
     if (!folderRes?.success || !folderRes?.data?.path) return null;
